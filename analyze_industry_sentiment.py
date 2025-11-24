@@ -10,6 +10,7 @@ Run:
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 from pathlib import Path
@@ -75,8 +76,7 @@ def call_model(client: OpenAI, messages: List[Dict[str, str]]) -> Dict[str, Dict
     resp = client.chat.completions.create(
         model=MODEL,
         messages=messages,
-        temperature=0,
-        max_tokens=4096,
+        max_completion_tokens=5000,
         response_format={"type": "json_object"},
     )
     return json.loads(resp.choices[0].message.content)
@@ -93,7 +93,15 @@ def iter_transcripts(dir_path: Path) -> Iterable[Path]:
     return sorted(p for p in dir_path.glob("*.txt"))
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Score industry sentiment for Xinwen Lianbo transcripts.")
+    parser.add_argument("--date", help="Run for a specific date (YYYYMMDD).")
+    parser.add_argument("--limit", type=int, help="Process at most N unscored days (in order).")
+    return parser.parse_args()
+
+
 def main() -> None:
+    args = parse_args()
     load_dotenv()
     if not os.getenv("OPENAI_API_KEY"):
         raise RuntimeError("OPENAI_API_KEY missing in environment (.env).")
@@ -103,10 +111,21 @@ def main() -> None:
     done_dates = set(cache.keys())
     client = OpenAI()
 
-    for transcript_path in iter_transcripts(TRANSCRIPTS_DIR):
+    if args.date:
+        target_paths = [TRANSCRIPTS_DIR / f"{args.date}.txt"]
+    else:
+        target_paths = list(iter_transcripts(TRANSCRIPTS_DIR))
+
+    processed = 0
+
+    for transcript_path in target_paths:
         date = transcript_path.stem
         if date in done_dates:
+            print(f"Skipping {date} (already scored).")
             continue
+
+        if args.limit is not None and processed >= args.limit:
+            break
 
         transcript = transcript_path.read_text(encoding="utf-8").strip()
         if not transcript:
@@ -116,6 +135,7 @@ def main() -> None:
         print(f"Scoring {date} with {MODEL}...")
         result = call_model(client, messages)
         append_results(cache, OUTPUT_JSON, date, MODEL, result)
+        processed += 1
 
 
 if __name__ == "__main__":

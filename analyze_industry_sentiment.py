@@ -16,6 +16,7 @@ MODEL = "gpt-5-mini"
 INDUSTRIES_PATH = Path("Industries_unique.txt")
 TRANSCRIPTS_DIR = Path("data/xinwenlianbo_texts")
 OUTPUT_JSON = Path("data/industry_sentiment.json")
+ERROR_DIR = Path("data/industry_sentiment_errors")
 
 
 def load_industries(path: Path) -> List[str]:
@@ -31,7 +32,12 @@ def load_cache(path: Path) -> Dict[str, Dict[str, object]]:
         return {}
 
 
-def build_messages(industries: List[str], transcript: str) -> List[Dict[str, str]]:
+def save_cache(cache: Dict[str, Dict[str, object]], path: Path) -> None:
+    # Caller must hold lock.
+    path.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def build_messages(industries: List[str], transcript: str) -> List[Dict[str, object]]:
     industries_block = "\n".join(f"- {name}" for name in industries)
     user_prompt = f"""\
 你是政策情绪分析员。给定当日《新闻联播》全文，请对下列每个行业给出政府态度的情绪评分。
@@ -41,12 +47,14 @@ def build_messages(industries: List[str], transcript: str) -> List[Dict[str, str
 - 正数表示积极/利好，负数表示消极/利空，0 表示未提及或无法判断。
 - 依据新闻内容对行业未来走势的倾向进行判断。
 
-输出格式：
-返回一个 JSON 对象，键为行业名称，值为包含 score 和 rationale 的对象，rationale 用一句简短中文概括依据。
+输出格式（必须为一个 JSON 对象，不要输出其他内容）：
+键为行业名称，值为包含 score 和 rationale 的对象；rationale 请控制在 20 个汉字以内。
+未提及则 score=0，rationale 写“未提及”。
+
 示例：
 {{
-  "Agriculture": {{"score": 20, "rationale": "提到加大农业补贴，利好农业"}},
-  "Banking": {{"score": 0, "rationale": "未提及银行业"}}
+  "Agriculture": {{"score": 20, "rationale": "加大农业补贴"}},
+  "Banking": {{"score": 0, "rationale": "未提及"}}
 }}
 
 行业列表：
@@ -58,20 +66,51 @@ def build_messages(industries: List[str], transcript: str) -> List[Dict[str, str
     return [
         {
             "role": "system",
-            "content": "You are a precise Chinese policy sentiment rater. Follow the format exactly and be concise.",
+            "content": [{"type": "text", "text": "You are a precise Chinese policy sentiment rater. Respond with JSON only."}],
         },
-        {"role": "user", "content": user_prompt},
+        {"role": "user", "content": [{"type": "text", "text": user_prompt}]},
     ]
 
 
-async def call_model(client: AsyncOpenAI, messages: List[Dict[str, str]]) -> Dict[str, Dict[str, object]]:
-    resp = await client.chat.completions.create(
-        model=MODEL,
-        messages=messages,
-        max_completion_tokens=5000,
-        response_format={"type": "json_object"},
-    )
-    return json.loads(resp.choices[0].message.content)
+class ResponseError(Exception):
+    def __init__(self, message: str, response: Dict[str, object] | None = None, preview: str | None = None):
+        super().__init__(message)
+        self.response = response
+        self.preview = preview
+
+
+async def call_model(
+    client: AsyncOpenAI, messages: List[Dict[str, object]], max_completion_tokens: int = 3000
+) -> Tuple[Dict[str, Dict[str, object]], Dict[str, object]]:
+    try:
+        resp = await client.chat.completions.create(
+            model=MODEL,
+            messages=messages,
+            response_format={"type": "json_object"},
+            reasoning_effort="minimal",
+            max_completion_tokens=max_completion_tokens,
+        )
+        raw = resp.model_dump()
+        content_text = (resp.choices[0].message.content or "").strip()
+        if not content_text:
+            raise ResponseError("empty response content", raw, "")
+        return json.loads(content_text), raw
+    except json.JSONDecodeError as exc:
+        preview = content_text[:200] if "content_text" in locals() else ""
+        raise ResponseError("json decode error", raw if "raw" in locals() else None, preview) from exc
+    except Exception as exc:
+        raise ResponseError(str(exc), raw if "raw" in locals() else None, "") from exc
+
+
+def log_error(date: str, err: ResponseError) -> None:
+    ERROR_DIR.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "date": date,
+        "error": str(err),
+        "content_preview": err.preview,
+        "response": err.response,
+    }
+    (ERROR_DIR / f"{date}.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 async def append_results(
@@ -84,7 +123,7 @@ async def append_results(
 ) -> None:
     async with lock:
         cache[date] = {"model": model, "results": data}
-        path.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+        save_cache(cache, path)
 
 
 def iter_transcripts(dir_path: Path) -> Iterable[Path]:
@@ -110,24 +149,17 @@ async def main_async() -> None:
     done_dates = set(cache.keys())
     client = AsyncOpenAI()
     lock = asyncio.Lock()
-    pbar_lock = asyncio.Lock()
 
-    if args.date:
-        target_paths = [TRANSCRIPTS_DIR / f"{args.date}.txt"]
-    else:
-        target_paths = list(iter_transcripts(TRANSCRIPTS_DIR))
+    targets = [TRANSCRIPTS_DIR / f"{args.date}.txt"] if args.date else list(iter_transcripts(TRANSCRIPTS_DIR))
 
     to_process: List[Tuple[str, str]] = []
-    for transcript_path in target_paths:
+    for transcript_path in targets:
         date = transcript_path.stem
         if date in done_dates:
-            print(f"Skipping {date} (already scored).")
             continue
-
         transcript = transcript_path.read_text(encoding="utf-8").strip()
         if not transcript:
             continue
-
         to_process.append((date, transcript))
         if args.limit is not None and len(to_process) >= args.limit:
             break
@@ -142,14 +174,13 @@ async def main_async() -> None:
         async with sem:
             messages = build_messages(industries, transcript)
             try:
-                result = await call_model(client, messages)
-            except Exception as exc:
-                print(f"Error scoring {date}: {exc}")
+                result, _raw = await call_model(client, messages)
+            except ResponseError as err:
+                log_error(date, err)
             else:
                 await append_results(cache, OUTPUT_JSON, date, MODEL, result, lock)
             finally:
-                async with pbar_lock:
-                    pbar.update(1)
+                pbar.update(1)
 
     tasks = [asyncio.create_task(worker(date, transcript)) for date, transcript in to_process]
     await asyncio.gather(*tasks)

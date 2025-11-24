@@ -9,6 +9,7 @@ from typing import Dict, Iterable, List, Tuple
 
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
+from tqdm.auto import tqdm
 
 
 MODEL = "gpt-5-mini"
@@ -109,6 +110,7 @@ async def main_async() -> None:
     done_dates = set(cache.keys())
     client = AsyncOpenAI()
     lock = asyncio.Lock()
+    pbar_lock = asyncio.Lock()
 
     if args.date:
         target_paths = [TRANSCRIPTS_DIR / f"{args.date}.txt"]
@@ -130,22 +132,28 @@ async def main_async() -> None:
         if args.limit is not None and len(to_process) >= args.limit:
             break
 
+    if not to_process:
+        return
+
     sem = asyncio.Semaphore(max(1, args.concurrency))
+    pbar = tqdm(total=len(to_process), desc="Scoring days")
 
     async def worker(date: str, transcript: str) -> None:
         async with sem:
             messages = build_messages(industries, transcript)
-            print(f"Scoring {date} with {MODEL}...")
             try:
                 result = await call_model(client, messages)
             except Exception as exc:
                 print(f"Error scoring {date}: {exc}")
-                return
-            await append_results(cache, OUTPUT_JSON, date, MODEL, result, lock)
+            else:
+                await append_results(cache, OUTPUT_JSON, date, MODEL, result, lock)
+            finally:
+                async with pbar_lock:
+                    pbar.update(1)
 
     tasks = [asyncio.create_task(worker(date, transcript)) for date, transcript in to_process]
-    if tasks:
-        await asyncio.gather(*tasks)
+    await asyncio.gather(*tasks)
+    pbar.close()
 
 
 if __name__ == "__main__":

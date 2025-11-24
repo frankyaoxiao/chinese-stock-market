@@ -11,13 +11,14 @@ Run:
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import os
 from pathlib import Path
-from typing import Dict, Iterable, List
+from typing import Dict, Iterable, List, Tuple
 
 from dotenv import load_dotenv
-from openai import OpenAI
+from openai import AsyncOpenAI
 
 
 MODEL = "gpt-5-mini"
@@ -72,8 +73,8 @@ def build_messages(industries: List[str], transcript: str) -> List[Dict[str, str
     ]
 
 
-def call_model(client: OpenAI, messages: List[Dict[str, str]]) -> Dict[str, Dict[str, object]]:
-    resp = client.chat.completions.create(
+async def call_model(client: AsyncOpenAI, messages: List[Dict[str, str]]) -> Dict[str, Dict[str, object]]:
+    resp = await client.chat.completions.create(
         model=MODEL,
         messages=messages,
         max_completion_tokens=5000,
@@ -82,11 +83,17 @@ def call_model(client: OpenAI, messages: List[Dict[str, str]]) -> Dict[str, Dict
     return json.loads(resp.choices[0].message.content)
 
 
-def append_results(
-    cache: Dict[str, Dict[str, object]], path: Path, date: str, model: str, data: Dict[str, Dict[str, object]]
+async def append_results(
+    cache: Dict[str, Dict[str, object]],
+    path: Path,
+    date: str,
+    model: str,
+    data: Dict[str, Dict[str, object]],
+    lock: asyncio.Lock,
 ) -> None:
-    cache[date] = {"model": model, "results": data}
-    path.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+    async with lock:
+        cache[date] = {"model": model, "results": data}
+        path.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def iter_transcripts(dir_path: Path) -> Iterable[Path]:
@@ -97,10 +104,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Score industry sentiment for Xinwen Lianbo transcripts.")
     parser.add_argument("--date", help="Run for a specific date (YYYYMMDD).")
     parser.add_argument("--limit", type=int, help="Process at most N unscored days (in order).")
+    parser.add_argument("--concurrency", type=int, default=3, help="Number of concurrent requests.")
     return parser.parse_args()
 
 
-def main() -> None:
+async def main_async() -> None:
     args = parse_args()
     load_dotenv()
     if not os.getenv("OPENAI_API_KEY"):
@@ -109,34 +117,46 @@ def main() -> None:
     industries = load_industries(INDUSTRIES_PATH)
     cache = load_cache(OUTPUT_JSON)
     done_dates = set(cache.keys())
-    client = OpenAI()
+    client = AsyncOpenAI()
+    lock = asyncio.Lock()
 
     if args.date:
         target_paths = [TRANSCRIPTS_DIR / f"{args.date}.txt"]
     else:
         target_paths = list(iter_transcripts(TRANSCRIPTS_DIR))
 
-    processed = 0
-
+    to_process: List[Tuple[str, str]] = []
     for transcript_path in target_paths:
         date = transcript_path.stem
         if date in done_dates:
             print(f"Skipping {date} (already scored).")
             continue
 
-        if args.limit is not None and processed >= args.limit:
-            break
-
         transcript = transcript_path.read_text(encoding="utf-8").strip()
         if not transcript:
             continue
 
-        messages = build_messages(industries, transcript)
-        print(f"Scoring {date} with {MODEL}...")
-        result = call_model(client, messages)
-        append_results(cache, OUTPUT_JSON, date, MODEL, result)
-        processed += 1
+        to_process.append((date, transcript))
+        if args.limit is not None and len(to_process) >= args.limit:
+            break
+
+    sem = asyncio.Semaphore(max(1, args.concurrency))
+
+    async def worker(date: str, transcript: str) -> None:
+        async with sem:
+            messages = build_messages(industries, transcript)
+            print(f"Scoring {date} with {MODEL}...")
+            try:
+                result = await call_model(client, messages)
+            except Exception as exc:
+                print(f"Error scoring {date}: {exc}")
+                return
+            await append_results(cache, OUTPUT_JSON, date, MODEL, result, lock)
+
+    tasks = [asyncio.create_task(worker(date, transcript)) for date, transcript in to_process]
+    if tasks:
+        await asyncio.gather(*tasks)
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main_async())

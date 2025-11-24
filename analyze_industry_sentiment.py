@@ -1,13 +1,3 @@
-"""
-Score government sentiment toward predefined industries in Xinwen Lianbo transcripts using GPT-5 mini.
-
-Prereqs:
-- .env with OPENAI_API_KEY
-- uv or pip: uv pip install openai python-dotenv
-Run:
-  uv run analyze_industry_sentiment.py
-"""
-
 from __future__ import annotations
 
 import argparse
